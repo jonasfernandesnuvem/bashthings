@@ -1,0 +1,13 @@
+---
+application: bonus-class-service
+image: youse-bonusclass-stage
+environment: stage
+dns:
+  - stage-bonusclass.youse.io
+puma:
+  enabled: true
+sneakers:
+  enabled: true
+  resources:
+    requests:
+      memory: 640

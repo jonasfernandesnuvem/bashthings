@@ -1,0 +1,365 @@
+---
+version: 2.1
+orbs:
+  aws-cli: circleci/aws-cli@2.0.0
+  aws-ecr: circleci/aws-ecr@6.15.3
+
+commands:
+  ruby-setup:
+    description: Install Bundler and dependencies
+    steps:
+      - run:
+          name: Ruby Version
+          command: |
+            ruby --version
+      - run:
+          name: Install Bundler
+          command: |
+            BUNDLER_VERSION=$(awk '/BUNDLED WITH/ { getline; print $1 }' Gemfile.lock) \
+              && gem install --no-document bundler -v $BUNDLER_VERSION
+      - restore_cache:
+          key: policysvc-ruby-{{ .Branch }}{{ checksum "Gemfile.lock" }}
+      - run:
+          name: Install Bundler dependencies
+          command: |
+            bundle install
+      - save_cache:
+          key: policysvc-ruby-{{ .Branch }}{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+  semtag:
+    description: Getting SEMTAG
+    steps:
+      - run:
+          name: Getting SEMTAG
+          command: |
+            sudo curl -o /bin/semtag https://raw.githubusercontent.com/pnikosis/semtag/v0.1.0/semtag
+            sudo chmod +x /bin/semtag
+            semtag --version
+  export_tag:
+    description: Export tag for qa or master branches
+    steps:
+      - run:
+          name: Export tag
+          command: >
+            if [ "$CIRCLE_BRANCH" = "master" ]; then
+              export TAG=$(semtag getfinal)
+              echo export LATEST_VERSION=$TAG >> $BASH_ENV
+            elif [ "$CIRCLE_BRANCH" = "qa" ]; then
+              export DATE=$(date "+%Y%m%d%H%M")
+              echo export LATEST_VERSION=$DATE >> $BASH_ENV
+            fi;
+  sentry-org-release:
+    description: Release a version on Sentry
+    steps:
+      - run:
+          name: Release a new version on Sentry
+          command: |
+            curl -sL https://sentry.io/get-cli/ | bash
+            export SENTRY_RELEASE=$(echo $LATEST_VERSION)
+            sentry-cli releases new -p $SENTRY_PROJECT $SENTRY_RELEASE
+            sentry-cli releases set-commits --auto $SENTRY_RELEASE
+            sentry-cli releases finalize $SENTRY_RELEASE
+  vpn-setup:
+    description: Install and connect to VPN Core
+    steps:
+      - run:
+          name: Install OpenVPN
+          command: |
+            # There seems to be a bug with the openvpn aptrepo sources
+            sudo apt-get update # for apt-get to recognise openvpn
+            sudo apt-get remove openvpn # remove ubuntu aptrepo source
+            sudo apt-get update
+            sudo apt-get -y install network-manager-openvpn network-manager-openvpn-gnome
+            sudo apt-get install openvpn dnsutils -y
+      - run:
+          name: Generate VPN files
+          command: |
+            echo $VPN_FILE | base64 --decode >> config.ovpn
+            echo $VPN_LOGIN | base64 --decode >> vpn.login
+      - run:
+          name: Connect to VPN
+          command: sudo openvpn --config config.ovpn --auth-user-pass vpn.login > openvpn.log 2>&1
+          background: true
+      - run:
+          name: Update DNS
+          command: |
+            while [ -n "$(ip addr show tun0 2>&1 > /dev/null)" ]; do sleep 0.1; done
+            sudo /bin/bash \
+              -c 'echo "nameserver 192.168.191.1" > /run/resolvconf/resolv.conf'
+  kubernetes-setup:
+    description: Install kubeconfig
+    steps:
+      - run:
+          name: Install kubeconfig
+          command: |
+            mkdir -p $HOME/.kube
+  helm-setup:
+    description: install helm setup
+    steps:
+      - run:
+          name: Install Helm
+          command: |
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+            sudo chmod 700 get_helm.sh
+            sudo ./get_helm.sh "$@"
+            
+jobs:
+  unit-test:
+    docker:
+      - image: circleci/ruby:2.6.6
+        environment:
+          BUNDLE_JOBS: 3
+          BUNDLE_RETRY: 3
+          BUNDLE_PATH: vendor/bundle
+          RAILS_ENV: test
+          POSTGRESQL_USER: postgres
+          POSTGRESQL_PASSWORD: postgres
+          POSTGRESQL_HOST: localhost
+          MESSAGE_BROKER_URL: amqp://guest:guest@localhost
+          MESSAGE_BROKER_VHOST: "/"
+      - image: circleci/postgres:12
+        environment:
+          POSTGRES_USER: "postgres"
+          POSTGRES_DB: "policysvc_test"
+          POSTGRES_PASSWORD: "postgres"
+          POSTGRES_HOST_AUTH_METHOD: trust
+      - image: rabbitmq:3.7-alpine
+        environment:
+          RABBITMQ_DEFAULT_VHOST: test
+    steps:
+      - checkout
+      - ruby-setup
+      - run: cp .env.example .env
+      - ruby-setup
+      - run: |
+          bundle exec rake db:create
+          bundle exec rake db:schema:load
+          bundle exec rake db:test:prepare
+          bundle exec rspec --tty \
+                            --colour \
+                            --profile 10 \
+                            --out test_results/rspec.xml \
+                            --format progress \
+                            $(circleci tests glob "spec/**/*_spec.rb" | circleci tests split --split-by=timings)
+      - store_test_results:
+          path: test_results
+  security-test:
+    docker:
+      - image: circleci/ruby:2.6.6
+    steps:
+      - checkout
+      - run:
+          name: Running brakeman
+          command: |
+            ruby --version
+            gem install brakeman
+            brakeman --color --no-exit-on-warn -o /dev/stdout -o brakeman-output.html
+      - store_artifacts:
+          path: brakeman-output.html
+  git-tag:
+    docker:
+      - image: cimg/base:2020.01
+    steps:
+      - checkout
+      - semtag
+      - run:
+          name: Generate Git TAG
+          command: |
+            if [ "$CIRCLE_BRANCH" = "master" ]; then
+              semtag getlast
+              semtag final
+            fi
+
+  platform-automated-testing:
+    machine: true
+    working_directory: ~/platform-automated-testing
+    steps:
+      - run:
+          name: Avoid hosts unknown for github
+          command: mkdir ~/.ssh/ || echo -e "Host github.com\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
+      - run:
+          name: "Git: Cloning platform-automated-testing"
+          command: git clone --single-branch --depth=1 git@github.com:youse-seguradora/platform-automated-testing.git .
+      - vpn-setup
+      - run:
+          name: Testing VPN
+          command: |
+            dig qa-gis.youse.io +short
+      - run:
+          name: Starting Selenium
+          command: docker run -p 4444:4444 --shm-size=2g selenium/standalone-chrome:latest
+          background: true
+      - run:
+          name: Set ruby version to 2.6.6
+          command: |
+            rvm install 2.6.6
+            echo . $(rvm 2.6.6 do rvm env --path) >> $BASH_ENV
+      - ruby-setup
+      - run:
+          name: Running Policy Service - Platform Automated Testing
+          command: |
+            ENV=stage \
+            BROWSER_ADDRESS=http://localhost:4444/wd/hub \
+            BROWSER=remote \
+            bundle exec parallel_rspec spec/journeys -n 6 -o '--tag services:policy_service --colour --tty --format progress'
+      - store_test_results:
+          path: reports
+  deploy-to-qa:
+    machine: true
+    steps:
+      - checkout
+      - semtag
+      - export_tag
+      - sentry-org-release
+      - kubernetes-setup
+      - vpn-setup
+      - helm-setup
+      - aws-ecr/build-and-push-image:
+          dockerfile: Dockerfile
+          path: .
+          account-url: AWS_ECR_SA_EAST_1_URL
+          aws-access-key-id: AWS_BRA_DEV_ACCESS_KEY_ID
+          aws-secret-access-key: AWS_BRA_DEV_SECRET_ACCESS_KEY
+          region: AWS_REGION_SA_EAST_1
+          create-repo: true
+          repo: policy-service-qa
+          tag: ${LATEST_VERSION},latest
+
+      - run:
+          name: KubeConfig
+          command: aws eks --region $AWS_REGION_SA_EAST_1 update-kubeconfig --name qa
+      - run:
+          name: Deploy app
+          command: |
+            helm repo add youse https://qa-charts.youse.io
+            helm repo update
+            helm upgrade --install --atomic --set image.tag=$LATEST_VERSION policy-service youse/ruby -f .helm/qa.yaml
+
+  deploy-to-stage:
+    machine: true
+    steps:
+      - checkout
+      - semtag
+      - export_tag
+      - sentry-org-release
+      - kubernetes-setup
+      - vpn-setup
+      - helm-setup
+      - aws-ecr/build-and-push-image:
+          dockerfile: Dockerfile
+          path: .
+          account-url: AWS_ECR_SA_EAST_1_URL
+          aws-access-key-id: AWS_BRA_DEV_ACCESS_KEY_ID
+          aws-secret-access-key: AWS_BRA_DEV_SECRET_ACCESS_KEY
+          region: AWS_REGION_SA_EAST_1
+          create-repo: true
+          repo: policy-service-stage
+          tag: ${LATEST_VERSION},latest
+      - run:
+          name: KubeConfig
+          command: aws eks --region $AWS_REGION_SA_EAST_1 update-kubeconfig --name stage
+
+      - run:
+          name: Deploy app
+          command: |
+            helm repo add youse https://stage-charts.youse.io
+            helm repo update
+            helm upgrade --install --atomic --set image.tag=$LATEST_VERSION policy-service youse/ruby -f .helm/stage.yaml
+
+  deploy-to-prod:
+    machine: true
+    steps:
+      - checkout
+      - semtag
+      - export_tag
+      - sentry-org-release
+      - kubernetes-setup
+      - vpn-setup
+      - helm-setup
+      - run:
+          name: Display tag
+          command: echo ${LATEST_VERSION}
+      - aws-ecr/build-and-push-image:
+          dockerfile: Dockerfile
+          path: .
+          account-url: AWS_ECR_SA_EAST_1_URL
+          aws-access-key-id: AWS_BRA_PROD_ACCESS_KEY_ID
+          aws-secret-access-key: AWS_BRA_PROD_SECRET_ACCESS_KEY
+          region: AWS_REGION_SA_EAST_1
+          create-repo: true
+          repo: policy-service
+          tag: ${LATEST_VERSION},latest
+      - run:
+          name: KubeConfig
+          command: aws eks --region $AWS_REGION_SA_EAST_1 update-kubeconfig --name production
+      - run:
+          name: Deploy app
+          command: |
+            helm repo add youse https://charts.youse.com.br
+            helm repo update
+            helm upgrade --install --atomic --set image.tag=$LATEST_VERSION policy-service youse/ruby -f .helm/production.yaml 
+       
+workflows:
+  version: 2
+  Pipeline:
+    jobs:
+      - unit-test
+      - security-test
+      - git-tag:
+          requires:
+            - unit-test
+            - security-test
+          filters:
+            branches:
+              only:
+                - master
+      - deploy-to-qa:
+          requires:
+            - unit-test
+            - security-test
+          context: 
+          - aws-bra-dev
+          - vpn-core
+          filters:
+            branches:
+              only:
+                - qa
+      - platform-automated-testing:
+          requires:
+            - deploy-to-stage
+          context: vpn-core
+          filters:
+            branches:
+              only:
+                - master
+      - deploy-to-stage:
+          requires:
+            - git-tag
+          context: aws-bra-dev
+          filters:
+            branches:
+              only:
+                - qa
+                - master
+      - promote-to-prod:
+          type: approval
+          context: promote-to-prod
+          requires:
+            - deploy-to-stage
+            - platform-automated-testing
+          filters:
+            branches:
+              only:
+                - master
+      - deploy-to-prod:
+          context: 
+            - aws-bra-prod
+            - vpn-core
+          requires:
+               - promote-to-prod
+          filters:
+            branches:
+              only:
+                - master
+
